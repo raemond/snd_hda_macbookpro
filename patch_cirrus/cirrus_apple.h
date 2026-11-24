@@ -1,6 +1,7 @@
 //#include <linux/ctype.h>
 #include <linux/timer.h>
 #include <linux/bitops.h>
+#include <linux/dmi.h>
 
 #include <linux/version.h>
 
@@ -1445,12 +1446,30 @@ static int cs_8409_apple_init(struct hda_codec *codec)
 	return 0;
 }
 
+static int cs_8409_boot_setup(struct hda_codec *codec);
+
 static int cs_8409_apple_resume(struct hda_codec *codec)
 {
+	struct cs8409_apple_spec *spec = codec->spec;
+
         myprintk("snd_hda_intel: cs_8409_apple_resume\n");
+
+	// after a system suspend (S3) the CS8409, CS42L83 and speaker amps have
+	// lost power, so the Apple boot sequence done at probe must be replayed
+	// otherwise the outputs stay silent until the module is reloaded
+	cs_8409_boot_setup(codec);
+
         // code copied from default resume ops
-        snd_hda_codec_init(codec);       
+        snd_hda_codec_init(codec);
 	snd_hda_regmap_sync(codec);
+
+	// force the per stream play/capture setup to run again on the next
+	// prepare - a stream left open over suspend would otherwise skip it
+	spec->play_init = 0;
+	spec->capture_init = 0;
+	spec->play_init_count = 0;
+	spec->capture_init_count = 0;
+
         myprintk("snd_hda_intel: end cs_8409_apple_resume\n");
         return 0;
 }
@@ -1762,12 +1781,23 @@ void cs_8409_apple_remove(struct hda_codec *codec)
 	//del_timer(&cs_8409_hp_timer);
 
 	snd_hda_gen_remove(codec);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+	// cs8409_apple replaces the ops of the (shared) codec driver, so put the
+	// original ops back - otherwise any re-probe (unbind/bind, hda reconfig)
+	// fails in hda_codec_driver_probe with -EINVAL as there is no .probe
+	hda_codec_to_driver(codec)->ops = &cs8409_codec_ops;
+#endif
 }
 
 
 // note this must come after any function definitions used
 
 static const struct hda_codec_ops cs_8409_apple_ops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+	// keep a probe entry so a re-probe still works if remove was not called
+	.probe = cs8409_probe,
+#endif
 	.build_controls = cs_8409_apple_build_controls,
 	.build_pcms = cs_8409_apple_build_pcms,
 	.init = cs_8409_apple_init,
@@ -2604,6 +2634,55 @@ static struct cs8409_apple_spec *cs8409_apple_alloc_spec(struct hda_codec *codec
 }
 
 
+// The Apple subsystem id of the CS8409 is written by the Mac firmware at power on.
+// A codec/controller reset after boot (eg PCI unbind/bind of the HDA controller)
+// clears it back to the chip default (same as the vendor id 0x10138409) so the
+// machine checks below would fail and we would fall back to the generic driver.
+// Recover the id from the last good probe, or failing that from the DMI product name.
+
+static unsigned int cs8409_apple_last_subsystem_id;
+
+static const struct {
+	const char *product;
+	unsigned int subsystem_id;
+} cs8409_apple_dmi_subsystem_ids[] = {
+	{ "MacBookPro14,1", 0x106b3300 },
+	{ "MacBookPro14,2", 0x106b3600 },
+	{ "MacBookPro14,3", 0x106b3900 },
+};
+
+static void cs8409_apple_fixup_subsystem_id(struct hda_codec *codec)
+{
+	unsigned int ssid = codec->core.subsystem_id;
+	int i;
+
+	if (ssid >> 16 == 0x106b) {
+		// valid Apple id - remember it for any later re-probe
+		cs8409_apple_last_subsystem_id = ssid;
+		return;
+	}
+
+	if (ssid != codec->core.vendor_id)
+		return;
+
+	if (cs8409_apple_last_subsystem_id) {
+		ssid = cs8409_apple_last_subsystem_id;
+	} else {
+		for (i = 0; i < ARRAY_SIZE(cs8409_apple_dmi_subsystem_ids); i++) {
+			if (dmi_match(DMI_PRODUCT_NAME, cs8409_apple_dmi_subsystem_ids[i].product)) {
+				ssid = cs8409_apple_dmi_subsystem_ids[i].subsystem_id;
+				break;
+			}
+		}
+	}
+
+	if (ssid != codec->core.subsystem_id) {
+		codec_info(codec, "subsystem id reset to 0x%08x, using 0x%08x\n",
+			   codec->core.subsystem_id, ssid);
+		codec->core.subsystem_id = ssid;
+	}
+}
+
 static int cs8409_apple(struct hda_codec *codec)
 {
         struct hda_codec_driver *driver;
@@ -2656,6 +2735,8 @@ static int cs8409_apple(struct hda_codec *codec)
         // probably should update the fixup tables and use those
         // for the moment just replicate the ifs being used
         // at the moment seem to get some crash if dont have a known subsystem id
+        cs8409_apple_fixup_subsystem_id(codec);
+
         fixup_found = 0;
         if (codec->core.subsystem_id == 0x106b3900) {
                 // macbook pro 14,3
